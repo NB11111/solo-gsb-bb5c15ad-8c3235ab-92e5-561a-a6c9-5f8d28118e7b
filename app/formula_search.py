@@ -9,18 +9,28 @@ still obtainable from the not-yet-assigned elements restricts the current
 element's integer count window, so counts that cannot possibly land inside
 the tolerance window are pruned without recursion.
 
-Each hit reuses the existing natural-abundance isotope convolution,
+Enumeration is fused with scoring: each within-tolerance composition is
+scored the moment it is found — natural-abundance isotope convolution,
 base-peak normalisation and one-to-one peak matching (unmatched peaks
-counted at zero intensity); candidates rank by MSE, then absolute mass
-error, then the element-symbol-lexicographic formula string. Searches
-visiting more than :data:`MAX_VISITED_NODES` nodes abort with
-:class:`SearchLimitExceeded` so an overly wide request cannot exhaust the
-worker.
+counted at zero intensity) — and offered to a bounded structure holding at
+most ``max_results`` candidates, so memory stays proportional to
+``max_results`` instead of growing with the hit count. Nothing of a
+discarded candidate (composition, envelope, pairing) is retained beyond
+its own scoring step. Candidates rank by MSE, then absolute mass error,
+then the element-symbol-lexicographic formula string; a fully identical
+key keeps the earlier-traversed candidate. Searches visiting more than
+:data:`MAX_VISITED_NODES` nodes abort with :class:`SearchLimitExceeded` so
+an overly wide request cannot exhaust the worker; because enumeration is
+cheap next to scoring, the production search first streams a counting-only
+pass that lets the cap abort before any envelope is built, then streams a
+second (deterministic, hence identical) pass that scores each hit.
 """
 
 from __future__ import annotations
 
+import heapq
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .enrichment import normalise_base_peak, pair_and_score
@@ -95,23 +105,33 @@ def formula_string(composition: dict[str, int]) -> str:
     )
 
 
-def enumerate_compositions(
-    target_mass: float,
-    mass_tolerance: float,
-    elements: list[ElementSpec],
-) -> tuple[list[tuple[tuple[int, ...], float]], int, int]:
-    """Branch-and-bound enumeration of compositions inside the mass window.
-
-    Elements are visited heaviest-mononisotopic-mass first (ties by symbol)
-    so the suffix mass bounds tighten as early as possible. Returns the raw
-    hits as ``((counts in visit order, monoisotopic mass), ...)`` plus the
-    visited-node and pruned-branch counters. Raises
-    :class:`SearchLimitExceeded` past :data:`MAX_VISITED_NODES` visits.
-    """
-    specs = sorted(
+def _visit_order(elements: list[ElementSpec]) -> list[ElementSpec]:
+    """Element visit order: heaviest monoisotopic mass first (ties broken
+    by symbol) so the suffix mass bounds tighten as early as possible."""
+    return sorted(
         elements,
         key=lambda e: (-most_abundant_isotope_mass(e.symbol), e.symbol),
     )
+
+
+def stream_compositions(
+    target_mass: float,
+    mass_tolerance: float,
+    elements: list[ElementSpec],
+    emit: Callable[[tuple[int, ...], float], None],
+) -> tuple[int, int]:
+    """Streaming branch-and-bound enumeration of compositions in the window.
+
+    Elements are visited heaviest-mononisotopic-mass first (ties by symbol)
+    so the suffix mass bounds tighten as early as possible. Every
+    within-tolerance composition is handed to ``emit`` as ``(counts in
+    visit order, monoisotopic mass)`` the moment it is found; nothing is
+    accumulated here, so callers can score hits one at a time without
+    holding them all. Returns the visited-node and pruned-branch counters.
+    Raises :class:`SearchLimitExceeded` past :data:`MAX_VISITED_NODES`
+    visits.
+    """
+    specs = _visit_order(elements)
     masses = [most_abundant_isotope_mass(s.symbol) for s in specs]
     n = len(specs)
 
@@ -125,7 +145,6 @@ def enumerate_compositions(
 
     visited_nodes = 0
     pruned_branches = 0
-    raw_hits: list[tuple[tuple[int, ...], float]] = []
 
     def visit(index: int, counts: list[int], partial_mass: float) -> None:
         nonlocal visited_nodes, pruned_branches
@@ -140,7 +159,7 @@ def enumerate_compositions(
                 partial_mass > 0.0
                 and abs(partial_mass - target_mass) <= mass_tolerance + _ROUND_EPS
             ):
-                raw_hits.append((tuple(counts), partial_mass))
+                emit(tuple(counts), partial_mass)
             return
 
         mass_i = masses[index]
@@ -166,7 +185,90 @@ def enumerate_compositions(
             counts.pop()
 
     visit(0, [], 0.0)
+    return visited_nodes, pruned_branches
+
+
+def enumerate_compositions(
+    target_mass: float,
+    mass_tolerance: float,
+    elements: list[ElementSpec],
+) -> tuple[list[tuple[tuple[int, ...], float]], int, int]:
+    """List-returning compatibility entry over :func:`stream_compositions`.
+
+    Collects every emitted hit as ``((counts in visit order, monoisotopic
+    mass), ...)`` plus the visited-node and pruned-branch counters; the
+    production search uses the streaming entry instead so its memory stays
+    bounded. Counters and :class:`SearchLimitExceeded` behaviour are
+    identical.
+    """
+    raw_hits: list[tuple[tuple[int, ...], float]] = []
+    visited_nodes, pruned_branches = stream_compositions(
+        target_mass,
+        mass_tolerance,
+        elements,
+        lambda counts, mass: raw_hits.append((counts, mass)),
+    )
     return raw_hits, visited_nodes, pruned_branches
+
+
+class _HitEntry:
+    """Heap entry ordering kept candidates worst-first.
+
+    Python's min-heap can then evict the worst kept candidate in
+    O(log capacity): a larger (worse) ranking key compares *smaller* here,
+    and a fully identical key is lost by the later traversal (larger
+    sequence number), which is what keeps ties on the first-traversed
+    candidate.
+    """
+
+    __slots__ = ("key", "seq", "hit")
+
+    def __init__(
+        self, key: tuple[float, float, str], seq: int, hit: FormulaHit
+    ) -> None:
+        self.key = key
+        self.seq = seq
+        self.hit = hit
+
+    def __lt__(self, other: _HitEntry) -> bool:
+        if self.key != other.key:
+            return self.key > other.key
+        return self.seq > other.seq
+
+
+class _TopHitBuffer:
+    """Bounded keeper of the best ``capacity`` candidates offered so far.
+
+    At most ``capacity`` hits (with their compositions, envelopes and
+    pairings) are referenced at any moment; a candidate that does not make
+    the cut is dropped by the caller right after :meth:`offer`, so memory
+    never grows with the number of hits.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        self._capacity = capacity
+        self._heap: list[_HitEntry] = []
+        self._seq = 0
+
+    def offer(self, hit: FormulaHit) -> None:
+        """Consider ``hit`` for the kept set in traversal order."""
+        key = (hit.mse, abs(hit.mass_error), hit.formula)
+        entry = _HitEntry(key, self._seq, hit)
+        self._seq += 1
+        if len(self._heap) < self._capacity:
+            heapq.heappush(self._heap, entry)
+        elif self._heap[0] < entry:
+            # Strictly better than the worst kept candidate: evict it. A
+            # fully tied key fails this comparison — the earlier traversal
+            # wins the tie — so only strict improvements ever evict.
+            heapq.heapreplace(self._heap, entry)
+
+    def ranked(self) -> list[FormulaHit]:
+        """Kept hits in final rank order: ascending key, ties by traversal."""
+        return [
+            entry.hit
+            for entry in sorted(self._heap, key=lambda e: (e.key, e.seq))
+        ]
 
 
 def _score_hit(
@@ -207,36 +309,52 @@ def search_formulas(
     prune: float,
 ) -> FormulaSearchResult:
     """Enumerate within-tolerance compositions and score them against the
-    base-peak-normalised observed peaks. Hits are ranked by ascending MSE,
-    then absolute mass error, then lexicographic formula, and capped at
-    ``max_results``; the total hit count is returned separately."""
+    base-peak-normalised observed peaks, one hit at a time.
+
+    A first streaming pass over :func:`stream_compositions` only counts
+    hits: enumeration is cheap next to scoring, and the
+    :data:`MAX_VISITED_NODES` cap aborts there — before any envelope is
+    built — so an overly wide request fails fast. A second (deterministic,
+    hence identical) streaming pass scores every composition as it is
+    emitted and offers it to a bounded top-``max_results`` buffer ranked by
+    ascending MSE, then absolute mass error, then lexicographic formula (a
+    fully identical key keeps the earlier traversal); only the kept
+    candidates survive, so memory does not grow with the hit count.
+    """
     obs = normalise_base_peak(observed)
-    raw_hits, visited_nodes, pruned_branches = enumerate_compositions(
-        target_mass, mass_tolerance, elements
+    specs = _visit_order(elements)
+
+    total_hits = 0
+
+    def count_hit(counts: tuple[int, ...], mono_mass: float) -> None:
+        nonlocal total_hits
+        total_hits += 1
+
+    visited_nodes, pruned_branches = stream_compositions(
+        target_mass, mass_tolerance, elements, count_hit
     )
 
-    specs = sorted(
-        elements,
-        key=lambda e: (-most_abundant_isotope_mass(e.symbol), e.symbol),
-    )
-    hits: list[FormulaHit] = []
-    for counts, mono_mass in raw_hits:
-        hit = _score_hit(
-            counts,
-            mono_mass,
-            target_mass,
-            specs,
-            obs,
-            mass_tolerance,
-            merge_tolerance,
-            prune,
+    buffer = _TopHitBuffer(max_results)
+
+    def score_and_offer(counts: tuple[int, ...], mono_mass: float) -> None:
+        buffer.offer(
+            _score_hit(
+                counts,
+                mono_mass,
+                target_mass,
+                specs,
+                obs,
+                mass_tolerance,
+                merge_tolerance,
+                prune,
+            )
         )
-        hits.append(hit)
 
-    hits.sort(key=lambda h: (h.mse, abs(h.mass_error), h.formula))
+    stream_compositions(target_mass, mass_tolerance, elements, score_and_offer)
+
     return FormulaSearchResult(
-        hits=hits[:max_results],
-        total_hits=len(hits),
+        hits=buffer.ranked(),
+        total_hits=total_hits,
         visited_nodes=visited_nodes,
         pruned_branches=pruned_branches,
     )
@@ -251,4 +369,5 @@ __all__ = [
     "enumerate_compositions",
     "formula_string",
     "search_formulas",
+    "stream_compositions",
 ]

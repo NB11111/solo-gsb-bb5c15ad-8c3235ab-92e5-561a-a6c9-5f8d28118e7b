@@ -2,17 +2,21 @@
 
 import pytest
 
+from app.enrichment import normalise_base_peak, pair_and_score
 from app.envelope import isotope_envelope, top_peaks
 from app.formula_search import (
     MAX_VISITED_NODES,
     ElementSpec,
+    FormulaHit,
     SearchLimitExceeded,
+    _TopHitBuffer,
     enumerate_compositions,
     formula_string,
     search_formulas,
+    stream_compositions,
 )
 from app.isotopes import most_abundant_isotope_mass
-from app.parser import parse_formula
+from app.parser import ParsedFormula, parse_formula
 
 TOL = 0.0001
 PRUNE = 1e-12
@@ -179,6 +183,85 @@ def test_enumerate_aborts_after_one_million_visited_nodes():
     assert excinfo.value.visited_nodes == MAX_VISITED_NODES + 1
 
 
+# --- streaming entry ----------------------------------------------------------
+
+def test_stream_compositions_emits_exactly_the_list_entry_sequence():
+    specs = [
+        ElementSpec("C", 0, 4),
+        ElementSpec("H", 0, 6),
+        ElementSpec("N", 0, 3),
+    ]
+    emitted = []
+    visited, pruned = stream_compositions(
+        42.0, 3.0, specs, lambda counts, mass: emitted.append((counts, mass))
+    )
+    raw, visited_list, pruned_list = enumerate_compositions(42.0, 3.0, specs)
+    assert emitted == raw
+    assert (visited, pruned) == (visited_list, pruned_list)
+
+
+def test_stream_compositions_aborts_after_one_million_visited_nodes():
+    with pytest.raises(SearchLimitExceeded) as excinfo:
+        stream_compositions(
+            60000.0,
+            60000.0,
+            [ElementSpec(symbol, 0, 200) for symbol in "CHONSP"],
+            lambda counts, mass: None,
+        )
+    assert excinfo.value.visited_nodes == MAX_VISITED_NODES + 1
+
+
+# --- bounded top-k buffer -----------------------------------------------------
+
+def _hit(mse: float, mass_error: float, formula: str) -> FormulaHit:
+    return FormulaHit(
+        formula=formula,
+        composition={},
+        monoisotopic_mass=100.0 + mass_error,
+        mass_error=mass_error,
+        mse=mse,
+        pairs=[],
+        predicted=[],
+    )
+
+
+def test_top_hit_buffer_keeps_best_capacity_in_rank_order():
+    buffer = _TopHitBuffer(3)
+    # Offered worst-first; the buffer must still end with the best three.
+    for mse, formula in [(9.0, "A"), (7.0, "B"), (8.0, "C"), (1.0, "D"),
+                         (3.0, "E"), (2.0, "F"), (6.0, "G")]:
+        buffer.offer(_hit(mse, 0.0, formula))
+    assert [h.formula for h in buffer.ranked()] == ["D", "F", "E"]
+
+
+def test_top_hit_buffer_tie_breaks_by_mass_error_then_formula():
+    buffer = _TopHitBuffer(3)
+    buffer.offer(_hit(1.0, 0.5, "B"))
+    buffer.offer(_hit(1.0, 0.2, "Z"))  # smaller |mass error| wins
+    buffer.offer(_hit(1.0, 0.5, "A"))  # same mse/error, smaller formula wins
+    buffer.offer(_hit(1.0, 0.9, "C"))  # dropped: worse |mass error|
+    assert [h.formula for h in buffer.ranked()] == ["Z", "A", "B"]
+
+
+def test_top_hit_buffer_full_tie_keeps_first_traversed():
+    # Identical ranking keys: only the traversal order (offer order) decides,
+    # so the first two offered survive and the later tie is discarded.
+    first, second, third = (_hit(1.0, 0.5, "A") for _ in range(3))
+    buffer = _TopHitBuffer(2)
+    buffer.offer(first)
+    buffer.offer(second)
+    buffer.offer(third)
+    assert buffer.ranked() == [first, second]
+
+
+def test_top_hit_buffer_never_holds_more_than_capacity():
+    buffer = _TopHitBuffer(2)
+    for i in range(50):
+        buffer.offer(_hit(float(i % 7), 0.1 * (i % 3), f"F{i}"))
+        assert len(buffer._heap) <= 2
+    assert len(buffer.ranked()) == 2
+
+
 # --- scoring/ranking --------------------------------------------------------
 
 def test_search_scores_glucose_best_from_its_natural_envelope():
@@ -261,3 +344,44 @@ def test_search_hit_pairs_one_to_one_with_observed_peaks():
     assert obs_indices == set(range(len(observed)))
     assert len(pred_indices) <= len(hit.predicted)
     assert len(hit.pairs) >= 1
+
+
+def test_search_top_k_matches_score_all_then_sort_reference():
+    # The streaming bounded buffer must reproduce the original semantics:
+    # score every hit, stable-sort by (mse, |mass error|, formula), slice.
+    elements = [ElementSpec("C", 0, 4), ElementSpec("H", 0, 6), ElementSpec("N", 0, 3)]
+    observed = [(42.0, 100.0), (43.0, 10.0), (44.5, 3.0)]
+    result = search_formulas(
+        42.0,
+        observed,
+        elements,
+        mass_tolerance=3.0,
+        max_results=4,
+        merge_tolerance=TOL,
+        prune=PRUNE,
+    )
+
+    raw, visited, pruned = enumerate_compositions(42.0, 3.0, elements)
+    order = [
+        e.symbol
+        for e in sorted(
+            elements, key=lambda e: (-most_abundant_isotope_mass(e.symbol), e.symbol)
+        )
+    ]
+    obs = normalise_base_peak(observed)
+    reference_keys = []
+    for counts, mass in raw:
+        composition = {s: c for s, c in zip(order, counts) if c > 0}
+        env = isotope_envelope(
+            ParsedFormula(composition=composition, labels={}), TOL, PRUNE
+        )
+        pred = normalise_base_peak(env)
+        _, mse = pair_and_score(obs, pred, 3.0)
+        reference_keys.append((mse, abs(mass - 42.0), formula_string(composition)))
+    reference_keys.sort()  # stable: full ties keep traversal order
+
+    got_keys = [(h.mse, abs(h.mass_error), h.formula) for h in result.hits]
+    assert got_keys == reference_keys[:4]
+    assert result.total_hits == len(raw)
+    assert result.visited_nodes == visited
+    assert result.pruned_branches == pruned
