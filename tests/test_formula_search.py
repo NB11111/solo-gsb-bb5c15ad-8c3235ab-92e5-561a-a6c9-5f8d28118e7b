@@ -1,14 +1,20 @@
 """Tests for the molecular-formula reverse search (branch and bound)."""
 
+import gc
+import weakref
+
 import pytest
 
 from app.envelope import isotope_envelope, top_peaks
 from app.formula_search import (
     MAX_VISITED_NODES,
     ElementSpec,
+    FormulaHit,
     SearchLimitExceeded,
+    _BoundedCandidates,
     enumerate_compositions,
     formula_string,
+    iter_compositions,
     search_formulas,
 )
 from app.isotopes import most_abundant_isotope_mass
@@ -261,3 +267,221 @@ def test_search_hit_pairs_one_to_one_with_observed_peaks():
     assert obs_indices == set(range(len(observed)))
     assert len(pred_indices) <= len(hit.predicted)
     assert len(hit.pairs) >= 1
+
+
+# --- streaming enumeration --------------------------------------------------
+
+def _drain(stream):
+    hits = []
+    try:
+        while True:
+            hits.append(next(stream))
+    except StopIteration as done:
+        stats = done.value
+    return hits, stats
+
+
+def test_iter_compositions_matches_list_entry_and_returns_counters():
+    specs = [
+        ElementSpec("C", 0, 4),
+        ElementSpec("H", 0, 6),
+        ElementSpec("N", 0, 3),
+    ]
+    target, tolerance = 42.0, 3.0
+    streamed, (stream_visited, stream_pruned) = _drain(
+        iter_compositions(target, tolerance, specs)
+    )
+    listed, visited, pruned = enumerate_compositions(target, tolerance, specs)
+    # Same hits, in the same traversal order, same counters.
+    assert streamed == listed
+    assert (stream_visited, stream_pruned) == (visited, pruned)
+
+
+def test_iter_compositions_emits_in_depth_first_order():
+    # Visit order is heaviest first (O, C, H); within an element counts
+    # ascend, so the stream order is the DFS leaf order.
+    stream = iter_compositions(
+        42.0,
+        3.0,
+        [
+            ElementSpec("C", 0, 4),
+            ElementSpec("H", 0, 6),
+            ElementSpec("O", 0, 3),
+        ],
+    )
+    streamed, _ = _drain(stream)
+    assert streamed == sorted(streamed)  # tuples ascend in (O, C, H) counts
+
+
+def test_iter_compositions_does_not_abort_when_consumer_stops_early():
+    # A consumer taking only the first hit must be able to close the
+    # generator without the node limit ever being observed.
+    stream = iter_compositions(
+        180.063388,
+        0.005,
+        [
+            ElementSpec("C", 0, 20),
+            ElementSpec("H", 0, 40),
+            ElementSpec("O", 0, 10),
+        ],
+    )
+    first = next(stream)
+    assert dict(zip(("O", "C", "H"), first[0])) == {"O": 6, "C": 6, "H": 12}
+    stream.close()
+
+
+def test_iter_compositions_carries_counters_when_limit_exceeded():
+    stream = iter_compositions(
+        60000.0,
+        60000.0,
+        [ElementSpec(symbol, 0, 200) for symbol in "CHONSP"],
+    )
+    with pytest.raises(SearchLimitExceeded) as excinfo:
+        _drain(stream)
+    assert excinfo.value.visited_nodes == MAX_VISITED_NODES + 1
+
+
+# --- bounded candidate structure --------------------------------------------
+
+def _hit(formula, mse, mass_error=0.0):
+    return FormulaHit(
+        formula=formula,
+        composition={},
+        monoisotopic_mass=mass_error,
+        mass_error=mass_error,
+        mse=mse,
+        pairs=[],
+        predicted=[],
+    )
+
+
+def test_bounded_candidates_keeps_best_by_full_ranking_key():
+    bounded = _BoundedCandidates(3)
+    offered = [
+        _hit("C", mse=5.0),  # seq 0
+        _hit("A", mse=1.0),  # seq 1
+        _hit("B", mse=3.0),  # seq 2
+        _hit("D", mse=3.0),  # seq 3: worse formula than B, evicted
+        _hit("E", mse=2.0),  # seq 4: pushes C (mse 5) out
+    ]
+    for seq, hit in enumerate(offered):
+        bounded.offer(hit, seq)
+    kept = bounded.ranked_hits()
+    assert [h.formula for h in kept] == ["A", "E", "B"]
+
+
+def test_bounded_candidates_full_key_tie_keeps_first_traversed():
+    bounded = _BoundedCandidates(1)
+    first = _hit("X", mse=1.0, mass_error=0.0)
+    second = _hit("X", mse=1.0, mass_error=0.0)
+    bounded.offer(first, seq=0)
+    bounded.offer(second, seq=1)
+    (kept,) = bounded.ranked_hits()
+    assert kept is first
+
+
+def test_bounded_candidates_evicted_candidate_is_released():
+    # Eviction must not retain the displaced hit: a weak reference to it
+    # must clear once a strictly better candidate takes its slot.
+    bounded = _BoundedCandidates(1)
+    worse = _hit("worse", mse=10.0)
+    bounded.offer(worse, seq=0)
+    ref = weakref.ref(worse)
+    del worse
+    bounded.offer(_hit("better", mse=1.0), seq=1)
+    gc.collect()
+    assert ref() is None
+    assert [h.formula for h in bounded.ranked_hits()] == ["better"]
+
+
+def test_bounded_candidates_capacity_is_the_hard_retention_limit():
+    bounded = _BoundedCandidates(2)
+    for seq, mse in enumerate((4.0, 3.0, 2.0, 1.0)):
+        bounded.offer(_hit(f"f{seq}", mse=mse), seq)
+    # No more than capacity hits retained, regardless of offers.
+    assert len(bounded.ranked_hits()) == 2
+    assert [h.mse for h in bounded.ranked_hits()] == [1.0, 2.0]
+
+
+# --- streaming production search --------------------------------------------
+
+def test_search_topk_matches_collect_all_then_sort():
+    specs = [
+        ElementSpec("C", 0, 5),
+        ElementSpec("H", 0, 8),
+        ElementSpec("N", 0, 4),
+        ElementSpec("O", 0, 3),
+    ]
+    kwargs = dict(
+        target_mass=60.0,
+        observed=[(60.0, 100.0), (61.0, 5.0)],
+        elements=specs,
+        mass_tolerance=3.0,
+        merge_tolerance=TOL,
+        prune=PRUNE,
+    )
+    capped = search_formulas(max_results=3, **kwargs)
+    full = search_formulas(max_results=1000, **kwargs)
+    assert capped.total_hits == full.total_hits
+    assert (
+        capped.visited_nodes,
+        capped.pruned_branches,
+    ) == (full.visited_nodes, full.pruned_branches)
+    assert len(capped.hits) == min(3, full.total_hits)
+    expected = sorted(
+        full.hits, key=lambda h: (h.mse, abs(h.mass_error), h.formula)
+    )[:3]
+    assert [h.formula for h in capped.hits] == [h.formula for h in expected]
+
+
+def test_search_releases_every_evicted_candidate_envelope(monkeypatch):
+    # The production path must score one hit at a time and drop losers:
+    # after a bounded search, weak references to scored hits show only the
+    # retained candidates stay alive.
+    specs = [
+        ElementSpec("C", 0, 5),
+        ElementSpec("H", 0, 8),
+        ElementSpec("N", 0, 4),
+        ElementSpec("O", 0, 3),
+    ]
+    result = search_formulas(
+        target_mass=60.0,
+        observed=[(60.0, 100.0), (61.0, 5.0)],
+        elements=specs,
+        mass_tolerance=3.0,
+        max_results=2,
+        merge_tolerance=TOL,
+        prune=PRUNE,
+    )
+    assert result.total_hits > 2
+    refs = []
+    seen = {}
+
+    from app import formula_search as fs
+
+    original = fs._score_hit
+
+    def tracking(*args, **kwargs):
+        hit = original(*args, **kwargs)
+        seen[id(hit)] = hit
+        refs.append(weakref.ref(hit))
+        return hit
+
+    monkeypatch.setattr(fs, "_score_hit", tracking)
+    bounded = search_formulas(
+        target_mass=60.0,
+        observed=[(60.0, 100.0), (61.0, 5.0)],
+        elements=specs,
+        mass_tolerance=3.0,
+        max_results=2,
+        merge_tolerance=TOL,
+        prune=PRUNE,
+    )
+    del seen
+    gc.collect()
+    alive = [obj for ref in refs if (obj := ref()) is not None]
+    retained = list(bounded.hits)
+    # Exactly the retained hits survive; every evicted hit was released.
+    assert len(alive) == len(retained)
+    assert {id(hit) for hit in alive} == {id(hit) for hit in retained}
+    assert len(retained) == 2
